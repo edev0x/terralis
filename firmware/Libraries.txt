@@ -1,0 +1,11 @@
+# Wokwi Library List
+# See https://docs.wokwi.com/guides/libraries
+
+DHT sensor library
+Adafruit Unified Sensor
+Adafruit BMP085 Library
+Adafruit BusIO
+Adafruit GFX Library
+Adafruit SSD1306
+RTClib
+PubSubClient
