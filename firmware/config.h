@@ -154,6 +154,31 @@ public:
         static constexpr const int MEDIUM_RISK[3] = { 12, 10, 12 };
         static constexpr const int HIGH_RISK[3] = { 24, 20, 24 };
     };
+
+    struct WaterMeasure
+    {
+        float soil_c, soil_f;
+        float layer;
+        float reserv;
+        bool layer_ok, tank_ok;
+    };
+
+    struct WeatherMeasure
+    {
+        float temp, humidity, pressure, rad, leaf; // hoja y radiacion en %
+        bool ok;
+    };
+
+    struct Alert
+    {
+        uint8_t code;
+        uint8_t epoch;
+    };
+
+    enum HearthBeats
+    {
+        H_RAIN, H_WATER, H_CONTROL, H_WEATHER, H_LOGGER, H_MQTT, H_UI, H_N
+    };
 };
 
 #endif
