@@ -2,21 +2,35 @@
 #define FIRMWARE_CONSTANTS_H
 
 #include <stdint.h>
+#include <stdio.h>
 
-class Constants
+// Codigos, estados y sus nombres. No depende de Arduino.
+namespace Constants
 {
-public:
-    Constants() = delete;
+    enum Crop : uint8_t
+    {
+        CROP_COFFEE = 0,
+        CROP_BEAN,
+        CROP_RICE,
+        N_CROPS
+    };
 
     enum CodeAlert : uint8_t
     {
-        AL_COFFEE_RISK = 0,
+        AL_COFFEE_RISK = 0, // AL_COFFEE_RISK + Crop da la alerta de cada cultivo
         AL_BEAN_RISK,
         AL_RICE_RISK,
         AL_RESERVOIR,
         AL_FAILURE,
         AL_PRESSURE,
         AL_N
+    };
+
+    enum IrrigationState : uint8_t
+    {
+        IR_IN_RANGE = 0,
+        IR_IRRIGATING = 1,
+        IR_IDLE = 2
     };
 
     enum LayerState : uint8_t
@@ -26,54 +40,60 @@ public:
         LAYER_DRAINING = 2
     };
 
+    // Mascaras de bits: se combinan con |
     enum Failure : uint8_t
     {
-        FL_WEATHER = 1,
-        FL_LAYER = 2,
-        FL_TANK = 3
+        FL_WEATHER = 1 << 0,
+        FL_LAYER = 1 << 1,
+        FL_TANK = 1 << 2
     };
 
     enum Blockage : uint8_t
     {
-        BL_RAIN = 1,
-        BL_PRESSURE = 2,
-        BL_RESERVOIR = 3,
-        BL_FAIULRE = 4
+        BL_RAIN = 1 << 0,
+        BL_PRESSURE = 1 << 1,
+        BL_RESERVOIR = 1 << 2,
+        BL_FAILURE = 1 << 3
     };
 
-    const enum Season : uint8_t
+    enum Season : uint8_t
     {
-        LLUVIOSA = 0,
-        CANICULA = 1,
-        SECA = 2
+        RAINY = 0,
+        DRY_SPELL = 1, // canicula
+        DRY = 2
     };
 
-    static uint8_t get_season(uint8_t month, uint8_t day)
+    // Latidos de las tareas para el vigilante por software
+    enum Heartbeat : uint8_t
+    {
+        H_RAIN = 0,
+        H_WATER,
+        H_CONTROL,
+        H_WEATHER,
+        H_LOGGER,
+        H_MQTT,
+        H_UI,
+        H_N
+    };
+
+    inline uint8_t get_season(int month, int day)
     {
         if ((month == 7 && day >= 15) || (month == 8 && day <= 15))
-        {
-            return CANICULA;
-        }
-        else if (month >= 5 && month <= 10)
-        {
-            return LLUVIOSA;
-        }
-        else
-        {
-            return SECA;
-        }
+            return DRY_SPELL;
+        if (month >= 5 && month <= 10)
+            return RAINY;
+        return DRY;
     }
 
-    inline static const char *alert_code(uint8_t code)
+    inline const char *alert_code(uint8_t code)
     {
         static const char *const n[AL_N] = {
             "RIESGO_CAFE", "RIESGO_FRIJOL", "RIESGO_ARROZ",
             "RESERVORIO_BAJO", "FALLA_SENSOR", "PRESION_CAYENDO"};
-
         return code < AL_N ? n[code] : "?";
     }
 
-    inline static const char *alert_message(uint8_t code)
+    inline const char *alert_message(uint8_t code)
     {
         static const char *const m[AL_N] = {
             "Riesgo alto de roya: inspeccionar el cafetal",
@@ -82,42 +102,42 @@ public:
             "Reservorio bajo: riego bloqueado",
             "Sensor fuera de rango: modo seguro, valvulas cerradas",
             "Caida rapida de presion: tormenta proxima, riego suspendido"};
-
         return code < AL_N ? m[code] : "?";
     }
 
-    inline static const char *irrigation_state(uint8_t stage)
+    inline const char *irrigation_state(uint8_t state)
     {
-        static const char *const n[3] = {
-            "EN_RANGO", "REGANDO", "REPOSO"};
-
-        return stage < 3 ? n[stage] : "?";
-    }
-
-    inline static const char *layer_name(uint8_t state)
-    {
-        static const char *const n[3] = {
-            "EN_BANDA", "LLENANDO", "DRENANDO"};
-
+        static const char *const n[3] = {"EN_RANGO", "REGANDO", "REPOSO"};
         return state < 3 ? n[state] : "?";
     }
 
-    inline static const char *risk_detail(uint8_t n)
+    inline const char *layer_name(uint8_t state)
     {
-        static const char *const t[3] = { "BAJO", "MEDIO", "ALTO" };
-        return n < 3 ? t[n] : "?";
+        static const char *const n[3] = {"EN_BANDA", "LLENANDO", "DRENANDO"};
+        return state < 3 ? n[state] : "?";
     }
 
-    inline static const char *time_of_year(uint8_t e) {
-        static const char *const n[3] = { "LLUVIOSA", "CANICULA", "SECA"};
-        return e < 3 ? n[e] : "?";
+    inline const char *risk_detail(uint8_t level)
+    {
+        static const char *const n[3] = {"BAJO", "MEDIO", "ALTO"};
+        return level < 3 ? n[level] : "?";
     }
 
-    static const uint8_t INVERTED_RAD  = 0; // 1 si el modulo LDR da mas voltaje con menos luz
-    static const uint8_t ACTIVE_RELAY_LOW = 0; // 1 si los modulos del rele se activan con nivel bajo
-    static const uint8_t FORCE_DATE = 0; // 1 - Se fuerza fecha 2026-11-08 06:00 para epoca seca
-    
-    static const uint8_t RF_SLOTS = 49; // 48 horas + hora en curso
-};
+    inline const char *season_name(uint8_t season)
+    {
+        static const char *const n[3] = {"LLUVIOSA", "CANICULA", "SECA"};
+        return season < 3 ? n[season] : "?";
+    }
+
+    // Texto corto con los bloqueos activos, por ejemplo "LL RE "
+    inline void blockage_text(uint8_t b, char *out, size_t n)
+    {
+        snprintf(out, n, "%s%s%s%s",
+                 (b & BL_RAIN) ? "LL " : "", (b & BL_PRESSURE) ? "PR " : "",
+                 (b & BL_RESERVOIR) ? "RE " : "", (b & BL_FAILURE) ? "FA " : "");
+        if (!out[0])
+            snprintf(out, n, "ninguno");
+    }
+}
 
 #endif
