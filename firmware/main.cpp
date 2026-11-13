@@ -828,7 +828,6 @@ void setup()
   startTasks();
 }
 
-// loop(): comandos y vigilante
 static void readSerial()
 {
   while (Serial.available())
@@ -836,7 +835,7 @@ static void readSerial()
     char c = Serial.read();
     if (c == 'x')
     {
-      Serial.println("CMD: tControl se cuelga (prueba E12); el vigilante reiniciara el sistema");
+      Serial.println("CMD: tControl se desactiva (E12); se reiniciara el sistema");
       hangControl = true;
     }
     else if (c == 'w')
@@ -846,7 +845,7 @@ static void readSerial()
     }
     else if (c == '?')
     {
-      Serial.println("Comandos: x = colgar tControl | w = perder/recuperar red");
+      Serial.println("Comandos: x = desactivar tControl | w = perder/recuperar red");
     }
   }
 }
