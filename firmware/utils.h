@@ -9,8 +9,6 @@
 #include "config.h"
 
 // Fechas, calculos agrometeorologicos, acumuladores y mensajes entre tareas.
-// No depende de Arduino: se puede compilar y probar en una PC.
-
 // Fechas a partir del epoch Unix
 namespace Time
 {
@@ -373,4 +371,4 @@ namespace Utils
     };
 }
 
-#endif // FIRMWARE_UTILS_H
+#endif
