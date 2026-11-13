@@ -4,263 +4,862 @@
 #include <SD.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <atomic>
 
-// Librerias de terceros
+// Bibliotecas de terceros
 #include <PubSubClient.h>
 #include <DHT.h>
-#include <Adafruit_BMP085.h>
+#include <Adafruit_BMP085.h> // el BMP180 usa esta biblioteca
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RTClib.h>
 
 #include "config.h"
 #include "constants.h"
+#include "control.h"
+#include "display.h"
 #include "logger.h"
 #include "pins.h"
 #include "utils.h"
 
-// Periodos reales en milisegundos
-#define MAXU(a, b) ((a) > (b) ? (a) : (b))
-#define PER_WEATHER_MILLS MAXU(Config::Time::T_CLIMA / Config::DEFAULT_ACEL, 2500UL)
-#define PER_WATER_MILLS MAXU(Config::Time::T_AGUA / Config::DEFAULT_ACEL, 1500UL) // 2 sensores
-#define PER_CONTROL_MILLS MAXU(Config::Time::CONTROL_MS / Config::DEFAULT_ACEL, 250UL)
+namespace Timing = Config::Timing;
+using Utils::Snapshot;
+
+struct MqttSession;
+struct ControlStats;
 
 // Objetos globales
-DHT dht(Pins::DHT_DATA, DHT22);
-Adafruit_SSD1306 oled(128, 64, &Wire, -1);
-RTC_DS1307 rtc;
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiCient);
-Preferences prefs;
+static DHT dht(Pins::DHT_DATA, DHT22);
+static Adafruit_BMP085 bmp;
+static Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+static RTC_DS1307 rtc;
+static WiFiClient wifiClient;
+static PubSubClient mqtt(wifiClient);
+static Preferences prefs;
 
-SemaphoreHandle_t mtxI2C, mtxSD, mtxNVS;
-QueueHandle_t q_pulse, q_rain, q_water, q_log, q_ui, q_mqtt, q_alert;
+static SemaphoreHandle_t mtxI2C, mtxSD, mtxNVS;
+static QueueHandle_t q_pulse, q_rain, q_weather, q_water, q_log, q_ui, q_mqtt, q_alert;
 
-// Estados compartidos
-volatile uint8_t stage[3] = {0, 1, 1};
-volatile bool snooze = false;
-volatile bool enableAlarm = false;
-volatile bool hangControl = false; // Comando 'x' en consola serial
-volatile bool noNetwork = false;   // Comando 'w' para simular que no hay red disponible
-volatile bool sdOk = false;
-volatile bool netOk = false;
-volatile bool bmpOk = false;
+// Estado compartido entre tareas
+static std::atomic<uint8_t> stage[Constants::N_CROPS]; // etapa de cafe, frijol y arroz
+static std::atomic<bool> snooze{false};                // alarma silenciada por el usuario
+static std::atomic<bool> alarmActive{false};
+static std::atomic<bool> hangControl{false}; // comando 'x'
+static std::atomic<bool> noNetwork{false};   // comando 'w'
+static std::atomic<bool> sdOk{false}, netOk{false}, bmpOk{false};
+static std::atomic<uint32_t> heartbeats[Constants::H_N];
 
-volatile uint32_t hearth_beats[Config::HearthBeats::H_N];
+static inline void beat(uint8_t task) { heartbeats[task] = millis(); }
 
-static const uint32_t MAX_HEARTH_BEAT[Config::HearthBeats::H_N]{
-    5000UL,                         // tLluvia - 5 segundos
-    3 * PER_WATER_MILLS + 5000UL,   // tAgua - 3 periodos de agua + 5 segundos
-    2 * PER_CONTROL_MILLS + 5000UL, // tControl - 2 periodos de control + 5 segundos
-    3 * PER_WEATHER_MILLS + 5000UL, // tClima - 3 periodos de clima + 5 segundos
-    10000UL,                        // tLogger - 10 segundos
-    30000UL,                        // tMqtt - 30 segundos
-    50000UL};                       // tUI - 50 segundos
+// Toma un mutex con tiempo limite y lo suelta al salir del bloque
+// Con Mutex se previene que las distintas tareas accedan al mismo recurso compartido 
+// con el fin de evitar conflictos de operaciones o datos corruptos
+class Lock
+{
+public:
+  Lock(SemaphoreHandle_t m, uint32_t timeoutMs)
+      : mutex(m), held(xSemaphoreTake(m, pdMS_TO_TICKS(timeoutMs)) == pdTRUE) {}
+  ~Lock()
+  {
+    if (held)
+      xSemaphoreGive(mutex);
+  }
+  explicit operator bool() const { return held; }
+  Lock(const Lock &) = delete;
+  Lock &operator=(const Lock &) = delete;
 
-static const char *const HB_NAME[Config::HearthBeats::H_N] = {
-    "tLluvia", "tAgua", "tControl", "tClima",
-    "tLogger", "tMQTT", "tUI"};
+private:
+  SemaphoreHandle_t mutex;
+  bool held;
+};
 
 // Tiempo simulado
 static uint32_t epoch0 = 0;
-static uint32_t mills0 = 0;
+static uint32_t millis0 = 0;
 
-uint32_t simEpoch()
+static uint32_t simEpoch()
 {
-    return epoch0 + (uint32_t)(((uint64_t)(millis() - mills0) * Config::DEFAULT_ACEL) / 1000ULL);
+  return epoch0 + (uint32_t)(((uint64_t)(millis() - millis0) * Config::TIME_ACCEL) / 1000ULL);
 }
 
-void write595(uint8_t logical)
+// Utilidades de hardware
+static void write595(uint8_t logical)
 {
-    uint8_t physical = logical;
+  uint8_t physical = logical;
+  if (Config::Hardware::RELAY_ACTIVE_LOW)
+    physical ^= Pins::Out::RELAY_MASK;
 
-    if (Constants::ACTIVE_RELAY_LOW)
-    {
-        physical ^= 0x1F; // bits 0-4 son relays y leds (5-7) siempre son activo altos
-    }
-
-    digitalWrite(PIN_595_LATCH, LOW);
-    shiftOut(PIN_595_DATA, PIN_595_CLK, MSBFIRST, physical);
-    digitalWrite(PIN_595_LATCH, HIGH);
+  digitalWrite(Pins::SR_LATCH, LOW);
+  shiftOut(Pins::SR_DATA, Pins::SR_CLK, MSBFIRST, physical);
+  digitalWrite(Pins::SR_LATCH, HIGH);
 }
 
-static float adcPercentage(int pin)
-{
-    return analogRead(pin) * 100.0f / 4095.0f;
-}
+static float adcPercentage(int pin) { return analogRead(pin) * 100.0f / 4095.0f; }
 
 static float distanceCm(int trig, int echo)
 {
-    digitalWrite(trig, LOW);
-    delayMicroseconds(2);
-    digitalWrite(trig, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(trig, LOW);
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
 
-    unsigned long us = pulseIn(echo, HIGH, 30000UL);
-
-    if (us == 0)
-        return NAN;
-    return us / 58.0f;
+  unsigned long us = pulseIn(echo, HIGH, 30000UL);
+  return us == 0 ? NAN : us / 58.0f;
 }
 
-// Mediana de 5 medidas; NaN si hay menos de 3 válidas
-// El rango de HC-SR05 es de 2 a 400 cm
+// Mediana de 5 medidas; NAN si hay menos de 3 validas (rango del HC-SR04: 2 a 400 cm)
 static float medianDistance(int trig, int echo)
 {
-    float v[5];
-    int n = 0;
-    for (int i = 0; i < 5; i++)
-    {
-        float d = distanceCm(trig, echo);
-        if (!isnan(d) && d >= 2.0f && d <= 400.0f)
-            v[n++] = d;
-
-        vTaskDelay(pdMS_TO_TICKS(60));
-    }
-
-    if (n < 3)
-        return NAN;
-
-    return Utils::median(v, n);
+  float v[5];
+  int n = 0;
+  for (int i = 0; i < 5; i++)
+  {
+    float d = distanceCm(trig, echo);
+    if (!isnan(d) && d >= 2.0f && d <= 400.0f)
+      v[n++] = d;
+    vTaskDelay(pdMS_TO_TICKS(60));
+  }
+  return n < 3 ? NAN : Utils::median(v, n);
 }
 
 static void buzzer(bool on)
 {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-    ledcWriteTone(Pins::BUZZER, on ? 2000 : 0);
+  ledcWriteTone(Pins::BUZZER, on ? 2000 : 0);
 #else
-    ledcWriteTone(0, on ? 2000 : 0);
+  ledcWriteTone(0, on ? 2000 : 0);
 #endif
 }
 
-static void saveStage(int i)
+// Etapas de los cultivos
+// Se guardan en memoria no volatil con las claves "e0", "e1" y "e2"
+static void saveStage(int crop)
 {
-    if (xSemaphoreTake(mtxNVS, pdMS_TO_TICKS(50)))
-    {
-        char k[3] = {'e', (char)('0' + i), 0};
-        prefs.putChar(k, stage[i]);
-        xSemaphoreGive(mtxNVS);
-    }
+  Lock lock(mtxNVS, 500);
+  if (!lock)
+    return;
+  char key[3] = {'e', (char)('0' + crop), 0};
+  prefs.putUChar(key, stage[crop]);
 }
 
-static void blockageText(uint8_t b, char *out, size_t n)
+static void loadStages()
 {
-    out[0] = 0;
-    if (b & Constants::BL_RAIN)
-        strlcat(out, "LL ", n);
-    if (b & Constants::BL_PRESSURE)
-        strlcat(out, "PR ", n);
-    if (b & Constants::BL_RESERVOIR)
-        strlcat(out, "RE ", n);
-    if (b & Constants::BL_FAIULRE)
-        strlcat(out, "FA ", n);
+  prefs.begin("finca", false);
+  for (int i = 0; i < Constants::N_CROPS; i++)
+  {
+    char key[3] = {'e', (char)('0' + i), 0};
+    uint8_t st = prefs.getUChar(key, Config::default_stage(i));
+    stage[i] = st < Config::stage_count(i) ? st : 0;
+  }
+}
 
-    if (!out[0])
-        strlcpy(out, "ninguno", n);
+static void nextStage(int crop)
+{
+  stage[crop] = (stage[crop] + 1) % Config::stage_count(crop);
+  saveStage(crop);
 }
 
 // Pluviometro
 void IRAM_ATTR isrRain()
 {
-    uint32_t t = millis();
-    BaseType_t wake = pdFALSE;
-
-    xQueueSendFromISR(q_pulse, &t, &wake);
-    if (wake)
-        portYIELD_FROM_ISR();
+  uint32_t t = millis();
+  BaseType_t wake = pdFALSE;
+  xQueueSendFromISR(q_pulse, &t, &wake);
+  if (wake)
+    portYIELD_FROM_ISR();
 }
 
-// Procesa los pulsos del pluviometro: descarta rebotes separados por menos de
-// 50 ms y envia a q_rain la lluvia correspondiente a cada pulso valido.
+// tRain: descarta rebotes y convierte cada vuelco del pluviometro en milimetros
 void tRain(void *)
 {
-    uint32_t t, last = 0;
-    bool first = true;
+  uint32_t t, last = 0;
+  bool first = true;
 
-    for (;;)
+  for (;;)
+  {
+    beat(Constants::H_RAIN);
+    if (xQueueReceive(q_pulse, &t, pdMS_TO_TICKS(1000)) != pdTRUE)
+      continue;
+    if (first || (uint32_t)(t - last) >= Config::Sensors::RAIN_DEBOUNCE_MS)
     {
-        hearth_beats[Config::HearthBeats::H_RAIN] = millis();
-
-        if (xQueueReceive(q_pulse, &t, pdMS_TO_TICKS(1000)) == pdTRUE)
-        {
-            if (first || (uint32_t)(t - last) >= 50UL)
-            {
-                first = false;
-                last = t;
-
-                float mm = Config::Sensors::MM_PER_PULSE;
-                xQueueSend(q_rain, &mm, 0);
-            }
-        }
+      first = false;
+      last = t;
+      float mm = Config::Sensors::MM_PER_PULSE;
+      xQueueSend(q_rain, &mm, 0);
     }
+  }
 }
 
-
-// Mide periódicamente la humedad del suelo y los niveles de la capa superficial y del tanque,
-// y publica las lecturas en la cola q_water.
-void tWater(void *) 
+// Clima
+static bool weatherInRange(const Utils::WeatherMeasure &m)
 {
-    TickType_t lastTick = xTaskGetTickCount();
+  return !isnan(m.temp) && m.temp > -10.0f && m.temp < 60.0f &&
+         !isnan(m.humidity) && m.humidity >= 0.0f && m.humidity <= 100.0f &&
+         !isnan(m.pressure) && m.pressure > 300.0f && m.pressure < 1100.0f;
+}
 
-    for (;;) {
-        hearth_beats[Config::HearthBeats::H_WATER] = millis();
+// tWeather: DHT22, BMP180, humedad de hoja y luz
+void tWeather(void *)
+{
+  TickType_t lastWake = xTaskGetTickCount();
 
-        Config::WaterMeasure water_measure;
-        water_measure.soil_c = adcPercentage(Pins::SOIL_COFFEE);
-        water_measure.soil_f = adcPercentage(Pins::SOIL_BEAN);
+  for (;;)
+  {
+    beat(Constants::H_WEATHER);
 
-        water_measure.layer_ok = true;
-        water_measure.layer = NAN;
-
-        if (Config::ClimateModel::MODELED_SURFACE_LAYER_DEPTH == 1.0f) {
-            float dl = medianDistance(Pins::LAYER_TRIG, Pins::LAYER_ECHO);
-            if (isnan(dl)) {
-                water_measure.layer_ok = false;
-            } else {
-                water_measure.layer = Config::Sensors::FLOOR_DISTANCE - dl;
-
-                if (water_measure.layer < 0.0f) water_measure.layer = 0.0f;
-            }
-        }
-
-        float dt = medianDistance(Pins::TANK_TRIG, Pins::TANK_ECHO);
-        if (isnan(dt))
-        {
-            water_measure.tank_ok = false;
-            water_measure.reserv = NAN;
-        }
-        else
-        {
-            water_measure.tank_ok = true;
-            water_measure.reserv = Utils::clampf((Config::Sensors::EMPTY_TANK_DISTANCE - dt) * 100.0f / (Config::Sensors::EMPTY_TANK_DISTANCE - Config::Sensors::FULL_TANK_DISTANCE),
-                              0.0f, 100.0f);
-        }
-        xQueueOverwrite(q_water, &water_measure);
-        vTaskDelayUntil(&lastTick, pdMS_TO_TICKS(PER_WATER_MILLS));
+    Utils::WeatherMeasure m;
+    m.temp = dht.readTemperature();
+    m.humidity = dht.readHumidity();
+    m.pressure = NAN;
+    if (bmpOk)
+    {
+      Lock lock(mtxI2C, 500);
+      if (lock)
+        m.pressure = bmp.readPressure() / 100.0f;
     }
+    m.leaf = adcPercentage(Pins::LEAF);
+    float light = adcPercentage(Pins::LDR);
+    m.rad = Config::Hardware::INVERTED_RAD ? 100.0f - light : light;
+    m.ok = weatherInRange(m);
+    xQueueOverwrite(q_weather, &m);
+
+    // Con el tiempo acelerado, mantiene el RTC alineado con el tiempo simulado
+    if (Config::TIME_ACCEL != 1)
+    {
+      Lock lock(mtxI2C, 500);
+      if (lock)
+        rtc.adjust(DateTime(simEpoch()));
+    }
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(Timing::WEATHER_PERIOD_MS));
+  }
+}
+
+// Agua
+// tWater: humedad de suelo, lamina del arroz y nivel del reservorio
+void tWater(void *)
+{
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;)
+  {
+    beat(Constants::H_WATER);
+
+    Utils::WaterMeasure m;
+    m.soil_coffee = adcPercentage(Pins::SOIL_COFFEE);
+    m.soil_bean = adcPercentage(Pins::SOIL_BEAN);
+
+    m.layer_ok = true;
+    m.layer = NAN;
+    if (!Config::Rice::LAYER_MODELED)
+    {
+      float d = medianDistance(Pins::LAYER_TRIG, Pins::LAYER_ECHO);
+      m.layer_ok = !isnan(d);
+      if (m.layer_ok)
+        m.layer = max(Config::Sensors::FLOOR_DISTANCE_CM - d, 0.0f);
+    }
+
+    const float EMPTY = Config::Sensors::EMPTY_TANK_DISTANCE_CM, FULL = Config::Sensors::FULL_TANK_DISTANCE_CM;
+    float d = medianDistance(Pins::TANK_TRIG, Pins::TANK_ECHO);
+    m.tank_ok = !isnan(d);
+    m.reservoir = m.tank_ok ? Utils::clampf((EMPTY - d) * 100.0f / (EMPTY - FULL), 0.0f, 100.0f) : NAN;
+
+    xQueueOverwrite(q_water, &m);
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(Timing::WATER_PERIOD_MS));
+  }
+}
+
+// Control
+// La logica esta en control.h; aqui solo se conecta con colas, salidas y puerto serie.
+struct ControlStats
+{
+  uint32_t droppedAlerts, droppedLogs, lateCycles;
+};
+
+static void readControlInputs(Control::Input &in)
+{
+  in.ms = millis();
+  in.epoch = simEpoch();
+
+  in.rain_mm = 0.0f;
+  float mm;
+  while (xQueueReceive(q_rain, &mm, 0) == pdTRUE)
+    in.rain_mm += mm;
+
+  in.has_weather = xQueueReceive(q_weather, &in.weather, 0) == pdTRUE;
+  in.has_water = xQueueReceive(q_water, &in.water, 0) == pdTRUE;
+  for (int i = 0; i < Constants::N_CROPS; i++)
+    in.stage[i] = stage[i];
+}
+
+static void emitAlerts(uint8_t alerts, uint32_t epoch, const char *stamp, ControlStats &stats)
+{
+  for (uint8_t code = 0; code < Constants::AL_N; code++)
+  {
+    if (!(alerts & (1u << code)))
+      continue;
+    Utils::Alert alert = {code, epoch};
+    if (xQueueSend(q_alert, &alert, 0) != pdTRUE)
+      stats.droppedAlerts++;
+    snooze = false; // una alerta nueva vuelve a activar el zumbador
+    Serial.printf("[%s] ALERTA %s: %s\n", stamp, Constants::alert_code(code), Constants::alert_message(code));
+  }
+}
+
+// Cambios de estado desde el ciclo anterior
+static void printChanges(const Snapshot &prev, const Snapshot &s, bool first, const char *stamp)
+{
+  if (s.state_coffee != prev.state_coffee)
+    Serial.printf("[%s] CAFE   %s -> %s\n", stamp, Constants::irrigation_state(prev.state_coffee),
+                  Constants::irrigation_state(s.state_coffee));
+  if (s.state_bean != prev.state_bean)
+    Serial.printf("[%s] FRIJOL %s -> %s\n", stamp, Constants::irrigation_state(prev.state_bean),
+                  Constants::irrigation_state(s.state_bean));
+  if (s.state_rice != prev.state_rice)
+    Serial.printf("[%s] ARROZ  %s -> %s (lamina %.1f cm, objetivo %.1f)\n", stamp,
+                  Constants::layer_name(prev.state_rice), Constants::layer_name(s.state_rice), s.layer,
+                  s.layer_target);
+  if (first || s.blockages != prev.blockages)
+  {
+    char txt[24];
+    Constants::blockage_text(s.blockages, txt, sizeof(txt));
+    Serial.printf("[%s] BLOQUEOS: %s\n", stamp, txt);
+  }
+}
+
+// Fila CSV por el puerto serie y, si hubo problemas, los contadores de diagnostico
+static void printSummary(const Snapshot &s, const ControlStats &stats, const char *stamp)
+{
+  char row[256];
+  Logger::format_csv(s, row, sizeof(row));
+  Serial.println(row);
+  if (stats.droppedAlerts || stats.droppedLogs || stats.lateCycles)
+    Serial.printf("[%s] DIAG alertas perdidas=%lu, registros perdidos=%lu, ciclos tardios=%lu\n", stamp,
+                  (unsigned long)stats.droppedAlerts, (unsigned long)stats.droppedLogs,
+                  (unsigned long)stats.lateCycles);
 }
 
 void tControl(void *)
 {
-    Utils::RainTracker rain;
-    rain.init();
+  static Control::Controller controller; // fuera de la pila de la tarea
+  controller.init(millis());
 
-    Utils::PressureTrend trend;
-    trend.init();
+  Control::Input in = Control::Input();
+  Control::Output out;
+  Snapshot prev;
+  memset(&prev, 0, sizeof(prev));
+  ControlStats stats = {0, 0, 0};
+  bool first = true;
+  uint32_t lastLog = 0, lastSummary = 0; // epoch simulado
+  uint32_t lastMqttMs = 0;               // tiempo real
+  TickType_t lastWake = xTaskGetTickCount();
 
+  for (;;)
+  {
+    if (hangControl) // prueba E12: la tarea deja de dar latidos
+    {
+      for (;;)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    beat(Constants::H_CONTROL);
 
-    Utils::FungalRisk risk[3];
+    readControlInputs(in);
+    controller.step(in, out);
+    write595(out.outputs); // sin datos (out.ready == false) todo queda cerrado
 
+    if (out.ready)
+    {
+      const Snapshot &s = out.snap;
+      char stamp[24];
+      Time::date_text(in.epoch, stamp, sizeof(stamp));
+
+      emitAlerts(out.alerts, in.epoch, stamp, stats);
+      alarmActive = out.alarm && !snooze;
+
+      xQueueOverwrite(q_ui, &s);
+      if (first || in.epoch - lastLog >= Timing::LOGGER_S)
+      {
+        lastLog = in.epoch;
+        if (xQueueSend(q_log, &s, 0) != pdTRUE)
+          stats.droppedLogs++;
+      }
+      if (first || in.ms - lastMqttMs >= Timing::MQTT_MS)
+      {
+        lastMqttMs = in.ms;
+        xQueueOverwrite(q_mqtt, &s);
+      }
+
+      printChanges(prev, s, first, stamp);
+      if (first || in.epoch - lastSummary >= 60) // resumen cada minuto simulado
+      {
+        lastSummary = in.epoch;
+        printSummary(s, stats, stamp);
+      }
+      prev = s;
+      first = false;
+    }
+
+    if (millis() - in.ms > Timing::CONTROL_PERIOD_MS)
+      stats.lateCycles++;
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(Timing::CONTROL_PERIOD_MS));
+  }
 }
 
+// Registro en la SD
+static bool saveLine(const char *line)
+{
+  static uint32_t lastRetry = 0;
+
+  Lock lock(mtxSD, 2000);
+  if (!lock)
+    return false;
+  if (!sdOk && millis() - lastRetry > 60000UL)
+  {
+    lastRetry = millis();
+    sdOk = SD.begin(Pins::SD_CS);
+  }
+  if (!sdOk)
+    return false;
+
+  File f = SD.open(Config::CSV_FILE, FILE_APPEND);
+  if (!f)
+  {
+    sdOk = false;
+    return false;
+  }
+  if (f.size() == 0)
+  {
+    f.print(Logger::csv_header());
+    f.print('\n');
+  }
+  f.print(line);
+  f.print('\n');
+  f.close();
+  return true;
+}
+
+void tLogger(void *)
+{
+  static Snapshot s;
+  static char line[256];
+
+  for (;;)
+  {
+    beat(Constants::H_LOGGER);
+    if (xQueueReceive(q_log, &s, pdMS_TO_TICKS(1000)) != pdTRUE)
+      continue;
+    Logger::format_csv(s, line, sizeof(line));
+    if (!saveLine(line))
+      Serial.println("SD: no se pudo registrar la fila");
+  }
+}
+
+// MQTT y reenvio diferido
+struct MqttSession
+{
+  bool wifiStarted;
+  uint32_t wifiMs, brokerMs;    // ultimo intento de conexion
+  uint32_t offset, savedOffset; // posicion en el CSV de lo ya reenviado (y lo guardado en NVS)
+  uint32_t resendMs, saveMs;
+};
+
+// Devuelve true si hay WiFi y broker. Si no, hace un intento de conexion y espera.
+static bool networkReady(MqttSession &s)
+{
+  if (noNetwork) // perdida de red simulada (E11)
+  {
+    if (mqtt.connected())
+      mqtt.disconnect();
+    if (WiFi.status() == WL_CONNECTED)
+      WiFi.disconnect(false);
+    s.wifiStarted = false;
+    netOk = false;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    return false;
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    netOk = false;
+    if (!s.wifiStarted || millis() - s.wifiMs > 15000UL)
+    {
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(Config::Network::SSID, Config::Network::PASSWORD, Config::Network::CHANNEL);
+      s.wifiStarted = true;
+      s.wifiMs = millis();
+    }
+    vTaskDelay(pdMS_TO_TICKS(250));
+    return false;
+  }
+
+  if (!mqtt.connected())
+  {
+    netOk = false;
+    if (millis() - s.brokerMs < 5000UL)
+    {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      return false;
+    }
+    s.brokerMs = millis();
+    if (!mqtt.connect(Config::MQTT::CLIENT_ID))
+    {
+      Serial.println("MQTT: sin conexion con el broker");
+      return false;
+    }
+    Serial.println("MQTT: conectado");
+  }
+  netOk = true;
+  return true;
+}
+
+static void publishTelemetry()
+{
+  static char json[704];
+  Snapshot s;
+  if (xQueueReceive(q_mqtt, &s, 0) != pdTRUE)
+    return;
+  Logger::format_json(s, json, sizeof(json));
+  if (strlen(json) < sizeof(json) - 2) // no se publica un JSON truncado
+    mqtt.publish(Config::MQTT::TELEMETRY_TOPIC, json);
+}
+
+static void publishAlerts()
+{
+  Utils::Alert a;
+  while (xQueueReceive(q_alert, &a, 0) == pdTRUE)
+  {
+    char stamp[24], buf[256];
+    Time::date_text(a.epoch, stamp, sizeof(stamp));
+    snprintf(buf, sizeof(buf), "{\"fecha\":\"%s\",\"codigo\":\"%s\",\"mensaje\":\"%s\"}", stamp,
+             Constants::alert_code(a.code), Constants::alert_message(a.code));
+    mqtt.publish(Config::MQTT::ALERTS_TOPIC, buf);
+  }
+}
+
+// Publica hasta 10 filas de la SD que aun no se han enviado y devuelve el nuevo desplazamiento
+static uint32_t resendPending(uint32_t off)
+{
+  const int BATCH = 10;
+  if (!mqtt.connected() || !sdOk)
+    return off;
+
+  String lines[BATCH];
+  int n = 0;
+  {
+    Lock lock(mtxSD, 500);
+    if (!lock)
+      return off;
+    File f = SD.open(Config::CSV_FILE, FILE_READ);
+    if (f)
+    {
+      if (off > f.size()) // el archivo se reemplazo
+        off = 0;
+      if (off == 0 && f.size() > 0) // salta el encabezado
+        off = f.readStringUntil('\n').length() + 1;
+      f.seek(off);
+      while (n < BATCH && f.available())
+        lines[n++] = f.readStringUntil('\n');
+      f.close();
+    }
+  }
+
+  for (int i = 0; i < n; i++)
+  {
+    if (lines[i].length() > 0 && !mqtt.publish(Config::MQTT::REGISTRY_TOPIC, lines[i].c_str()))
+      break;
+    off += lines[i].length() + 1;
+  }
+  return off;
+}
+
+// Reenvia filas pendientes cada 500 ms y guarda el avance en NVS como mucho cada 30 s
+static void resendAndSave(MqttSession &s)
+{
+  if (millis() - s.resendMs < 500UL)
+    return;
+  s.resendMs = millis();
+  s.offset = resendPending(s.offset);
+
+  if (s.offset == s.savedOffset || millis() - s.saveMs <= 30000UL)
+    return;
+  Lock lock(mtxNVS, 500);
+  if (!lock)
+    return;
+  prefs.putUInt("off", s.offset);
+  s.savedOffset = s.offset;
+  s.saveMs = millis();
+}
+
+void tMQTT(void *)
+{
+  mqtt.setServer(Config::MQTT::HOST, Config::MQTT::PORT);
+  mqtt.setBufferSize(768);
+  mqtt.setSocketTimeout(3);
+
+  MqttSession session = MqttSession();
+  session.brokerMs = millis() - 5000UL; // permite el primer intento de inmediato
+  {
+    Lock lock(mtxNVS, 500);
+    if (lock)
+      session.offset = prefs.getUInt("off", 0);
+  }
+  session.savedOffset = session.offset;
+
+  for (;;)
+  {
+    beat(Constants::H_MQTT);
+    if (!networkReady(session))
+      continue;
+
+    mqtt.loop();
+    publishTelemetry();
+    publishAlerts();
+    resendAndSave(session);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// Interfaz local
+// tUI: pulsadores, zumbador y pantalla
+void tUI(void *)
+{
+  static Snapshot s;
+  bool hasData = false;
+  int page = 0;
+  bool nextPrev = false, okPrev = false, okLong = false;
+  uint32_t okPressMs = 0, lastDraw = 0;
+
+  for (;;)
+  {
+    beat(Constants::H_UI);
+
+    bool next = digitalRead(Pins::BTN_NEXT) == LOW;
+    bool ok = digitalRead(Pins::BTN_OK) == LOW;
+    bool changed = false;
+
+    if (next && !nextPrev) // SIG: pagina siguiente
+    {
+      page = (page + 1) % Display::N_PAGES;
+      changed = true;
+    }
+    if (ok && !okPrev)
+    {
+      okPressMs = millis();
+      okLong = false;
+    }
+    if (ok && okPrev && !okLong && millis() - okPressMs >= 1500UL)
+    {
+      okLong = true;
+      snooze = true; // OK largo: silencia la alarma
+    }
+    if (!ok && okPrev && !okLong && Display::isStagePage(page))
+    {
+      nextStage(Display::cropOfPage(page)); // OK corto en las paginas de etapa
+      changed = true;
+    }
+    nextPrev = next;
+    okPrev = ok;
+
+    if (xQueueReceive(q_ui, &s, 0) == pdTRUE)
+      hasData = true;
+
+    // Zumbador: pitido corto cada 2 s mientras haya alarma sin silenciar
+    buzzer(alarmActive && (millis() % 2000UL) < 200UL);
+
+    if (changed || millis() - lastDraw >= Timing::UI_REFRESH_MS)
+    {
+      lastDraw = millis();
+      Display::Status status = {sdOk, netOk, alarmActive, snooze};
+      Lock lock(mtxI2C, 300);
+      if (lock)
+        Display::draw(oled, s, hasData, page, status);
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+// Tareas y vigilante
+// Una fila por tarea, en el orden de Constants::Heartbeat. maxSilenceMs es el
+// tiempo sin latidos tras el cual el vigilante reinicia el sistema.
+struct TaskSpec
+{
+  TaskFunction_t run;
+  const char *name;
+  uint32_t stackBytes;
+  UBaseType_t priority;
+  BaseType_t core; // 1 = medicion y control | 0 = comunicaciones e interfaz
+  uint32_t maxSilenceMs;
+};
+
+static const TaskSpec TASKS[Constants::H_N] = {
+    {tRain, "tLluvia", 2048, 5, 1, 5000UL},
+    {tWater, "tAgua", 3072, 3, 1, Timing::staleAfter(Timing::WATER_PERIOD_MS)},
+    {tControl, "tControl", 6144, 3, 1, 2 * Timing::CONTROL_PERIOD_MS + 5000UL},
+    {tWeather, "tClima", 4096, 2, 1, Timing::staleAfter(Timing::WEATHER_PERIOD_MS)},
+    {tLogger, "tLogger", 6144, 1, 0, 10000UL},
+    {tMQTT, "tMQTT", 8192, 1, 0, 30000UL},
+    {tUI, "tUI", 5120, 1, 0, 5000UL}};
+
+static void startTasks()
+{
+  for (int i = 0; i < Constants::H_N; i++)
+    beat(i);
+  for (int i = 0; i < Constants::H_N; i++)
+    xTaskCreatePinnedToCore(TASKS[i].run, TASKS[i].name, TASKS[i].stackBytes, NULL, TASKS[i].priority,
+                            NULL, TASKS[i].core);
+}
+
+static void checkHeartbeats()
+{
+  for (int i = 0; i < Constants::H_N; i++)
+  {
+    if (millis() - heartbeats[i] <= TASKS[i].maxSilenceMs)
+      continue;
+    Serial.printf("VIGILANTE: %s sin latidos, se reinicia el sistema\n", TASKS[i].name);
+    write595(0); // valvulas y bomba cerradas antes de reiniciar
+    delay(200);
+    ESP.restart();
+  }
+}
+
+// Arranque
+static void initPins()
+{
+  // Primero se fijan las salidas en estado seguro (todo cerrado)
+  pinMode(Pins::SR_DATA, OUTPUT);
+  pinMode(Pins::SR_CLK, OUTPUT);
+  pinMode(Pins::SR_LATCH, OUTPUT);
+  write595(0);
+
+  pinMode(Pins::BTN_NEXT, INPUT_PULLUP);
+  pinMode(Pins::BTN_OK, INPUT_PULLUP);
+  pinMode(Pins::RAIN, INPUT_PULLUP);
+  pinMode(Pins::LAYER_TRIG, OUTPUT);
+  pinMode(Pins::LAYER_ECHO, INPUT);
+  pinMode(Pins::TANK_TRIG, OUTPUT);
+  pinMode(Pins::TANK_ECHO, INPUT);
+  pinMode(Pins::BUZZER, OUTPUT);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(Pins::BUZZER, 2000, 8);
+#else
+  ledcSetup(0, 2000, 8);
+  ledcAttachPin(Pins::BUZZER, 0);
+#endif
+  buzzer(false);
+}
+
+// Inicializacion de colas de MQTT
+static void initQueues()
+{
+  mtxI2C = xSemaphoreCreateMutex();
+  mtxSD = xSemaphoreCreateMutex();
+  mtxNVS = xSemaphoreCreateMutex();
+
+  q_pulse = xQueueCreate(16, sizeof(uint32_t));
+  q_rain = xQueueCreate(16, sizeof(float));
+  q_weather = xQueueCreate(1, sizeof(Utils::WeatherMeasure));
+  q_water = xQueueCreate(1, sizeof(Utils::WaterMeasure));
+  q_log = xQueueCreate(4, sizeof(Snapshot));
+  q_ui = xQueueCreate(1, sizeof(Snapshot));
+  q_mqtt = xQueueCreate(1, sizeof(Snapshot));
+  q_alert = xQueueCreate(8, sizeof(Utils::Alert));
+}
+
+// Fija el origen del tiempo simulado a partir del reloj de tiempo real
+static void initClock()
+{
+  const DateTime initial(2026, 11, 8, 6, 0, 0);
+  if (!rtc.begin())
+  {
+    Serial.println("RTC: no responde, se usa la fecha inicial");
+    epoch0 = initial.unixtime();
+  }
+  else
+  {
+    if (Config::Hardware::FORCE_DATE || !rtc.isrunning() || rtc.now().year() < 2025)
+      rtc.adjust(initial);
+    epoch0 = rtc.now().unixtime();
+  }
+  millis0 = millis();
+}
+
+static void initPeripherals()
+{
+  bmpOk = bmp.begin();
+  if (!bmpOk)
+    Serial.println("BMP180: no responde (se activara el modo seguro)");
+  dht.begin();
+
+  if (oled.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+    Display::splash(oled);
+  else
+    Serial.println("OLED: no responde");
+
+  SPI.begin(Pins::SD_SCK, Pins::SD_MISO, Pins::SD_MOSI, Pins::SD_CS);
+  sdOk = SD.begin(Pins::SD_CS);
+  Serial.println(sdOk ? "SD: lista" : "SD: no disponible");
+}
 
 void setup()
 {
-    // Setup code here, to run once:
+  initPins();
+
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\nEstacion agrometeorologica - SID-V01-022026");
+  Serial.println("\n2900032023, 2921332017, 2910242023, 2912392022, 2921572023, 2908262023");
+
+  initQueues();
+
+  // I2C a 100 kHz porque el DS1307 no admite mas
+  Wire.begin(Pins::I2C_SDA, Pins::I2C_SCL);
+  Wire.setClock(100000);
+
+  initClock();
+  initPeripherals();
+  loadStages();
+  attachInterrupt(digitalPinToInterrupt(Pins::RAIN), isrRain, FALLING);
+
+  char stamp[24];
+  Time::date_text(epoch0, stamp, sizeof(stamp));
+  Serial.printf("Fecha inicial: %s | ACEL = %lu\n", stamp, (unsigned long)Config::TIME_ACCEL);
+  Serial.println(Logger::csv_header());
+
+  startTasks();
+}
+
+// loop(): comandos y vigilante
+static void readSerial()
+{
+  while (Serial.available())
+  {
+    char c = Serial.read();
+    if (c == 'x')
+    {
+      Serial.println("CMD: tControl se cuelga (prueba E12); el vigilante reiniciara el sistema");
+      hangControl = true;
+    }
+    else if (c == 'w')
+    {
+      noNetwork = !noNetwork;
+      Serial.println(noNetwork ? "CMD: red desconectada (E11)" : "CMD: red restablecida");
+    }
+    else if (c == '?')
+    {
+      Serial.println("Comandos: x = colgar tControl | w = perder/recuperar red");
+    }
+  }
 }
 
 void loop()
 {
-    // Main code here, to run repeatedly:
+  static uint32_t lastCheck = 0;
+
+  readSerial();
+  if (millis() - lastCheck >= 1000UL)
+  {
+    lastCheck = millis();
+    checkHeartbeats();
+  }
+  delay(50);
 }
