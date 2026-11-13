@@ -2,6 +2,7 @@
 #define FIRMWARE_CONFIG_H
 
 #include <stdint.h>
+#include <string>
 
 class Config {
 public:
@@ -18,36 +19,36 @@ public:
     static const uint8_t DEFAULT_ACEL = 1;
 
     // Valor por defecto del archivo CSV de registro de datos en MicroSD
-    static const std::string CSV_DEFAULT_NAME = "registro.csv";
+    static inline const std::string CSV_DEFAULT_NAME = "registro.csv";
 
     struct Network {
         Network() = delete;
 
-        static const std::string SSID = "WOKWI-GUEST";
-        static const std::string PASSWORD = "";
+        static inline const std::string SSID = "WOKWI-GUEST";
+        static inline const std::string PASSWORD = "";
     };
     
 
     struct MQTT {
         MQTT() = delete;
 
-        static const std::string HOST  = "broker.hivemq.com";
+        static inline const std::string HOST  = "broker.hivemq.com";
         static const uint16_t PORT = 1883;
-        static const std::string CLIENT_ID = "terraliesp3201";
+        static inline const std::string CLIENT_ID = "terraliesp3201";
 
-        static const std::string TELEMETRY_TOPIC = "terralis/sv/telemetry";
-        static const std::string REGISTRY_TOPIC = "terralis/sv/registry";
-        static const std::string ALERTS_TOPIC = "terralis/sv/alerts";
+        static inline const std::string TELEMETRY_TOPIC = "terralis/sv/telemetry";
+        static inline const std::string REGISTRY_TOPIC = "terralis/sv/registry";
+        static inline const std::string ALERTS_TOPIC = "terralis/sv/alerts";
     };
 
     struct Time {
         Time() = delete;
 
-        static const uint16_t T_CLIMA = 60_000UL;  // 1 minuto
-        static const uint16_t T_AGUA  = 10_000UL;  // 10 segundos
-        static const uint16_t CONTROL_MS = 10_000UL;  // 10 segundos
+        static const uint16_t T_CLIMA = 60000UL;  // 1 minuto
+        static const uint16_t T_AGUA  = 10000UL;  // 10 segundos
+        static const uint16_t CONTROL_MS = 10000UL;  // 10 segundos
         static const uint16_t LOGGER_SECONDS = 60UL;  // 60 segundos
-        static const uint16_t MQTT_MS = 60_000UL;  // 1 minuto
+        static const uint16_t MQTT_MS = 60000UL;  // 1 minuto
         static const uint16_t UI_REFRESH_MS = 200UL;  // 200 milisegundos
     };
 
@@ -116,28 +117,28 @@ public:
         static const uint8_t N_RICE_STAGES = 4;
         static const uint8_t RICE_DRAIN_STAGE = 3;
 
-        static const float KC_COFFEE[N_COFFEE_STAGES] = { 0.90f, 1.05f }; // Coeficientes de cultivo para café
-        static const float KC_BEAN[N_BEAN_STAGES] = { 0.40f, 1.15f, 0.35f }; // Coeficientes de cultivo para frijol
-        static const float KC_RICE[N_RICE_STAGES] = { 1.05f, 1.20f, 1.20f, 0.90f }; // Coeficientes de cultivo para arroz
+        static constexpr float KC_COFFEE[N_COFFEE_STAGES] = { 0.90f, 1.05f }; // Coeficientes de cultivo para café
+        static constexpr float KC_BEAN[N_BEAN_STAGES] = { 0.40f, 1.15f, 0.35f }; // Coeficientes de cultivo para frijol
+        static constexpr float KC_RICE[N_RICE_STAGES] = { 1.05f, 1.20f, 1.20f, 0.90f }; // Coeficientes de cultivo para arroz
 
-        static const float LAYER_OBJ_CM[N_RICE_STAGES] = { 2.5f, 5.0f, 7.0f, 0.0f }; // Profundidad de la capa superficial del suelo para cada etapa del arroz (cm)
+        static constexpr float LAYER_OBJ_CM[N_RICE_STAGES] = { 2.5f, 5.0f, 7.0f, 0.0f }; // Profundidad de la capa superficial del suelo para cada etapa del arroz (cm)
 
         static const float LAYER_BAND = 1.0f; // Ancho de la banda de profundidad para el cálculo de la capa superficial del suelo (cm)
         static const float LAYER_MAX_MARGIN = 3.0f; // Margen máximo de profundidad para la capa superficial del suelo (cm)
         static const uint8_t IRRIGATING_RICE = 1; 
 
-        static const char *const COFFEE_STAGES_NAMES[N_COFFEE_STAGES] = {
+        static constexpr const char *const COFFEE_STAGES_NAMES[N_COFFEE_STAGES] = {
             "Sin malezas (0.90)",
             "Con cobertura (1.05)"
         };
 
-        static const char *const BEAN_STAGES_NAMES[N_BEAN_STAGES] = {
+        static constexpr const char *const BEAN_STAGES_NAMES[N_BEAN_STAGES] = {
             "Inicial (0.40)",
             "Medio (1.15)",
             "Final (0.35)"
         };
 
-        static const char *const RICE_STAGES_NAMES[N_RICE_STAGES] = {
+        static constexpr const char *const RICE_STAGES_NAMES[N_RICE_STAGES] = {
             "Establecimiento (2.5cm)",
             "Macollam. (5cm)",
             "Floración (7cm)",
@@ -146,13 +147,38 @@ public:
 
         // Riesgo fitosanitario
         // Indice = 0 cafe (roya) | 1 = frijol (mustia/antracnosis) | 2 = arroz (anublo)
-        static const float RISK_MIN[3] = {18.0f, 18.0f, 20.0f};
-        static const float RISK_MAX[3] = {28.0f, 26.0f, 28.0f};
-        static const float RISK_HR_MIN[3] = { 0.0f, 90.0f, 90.0f }; // El cafe usa hoja humeda
+        static constexpr const float RISK_MIN[3] = {18.0f, 18.0f, 20.0f};
+        static constexpr const float RISK_MAX[3] = {28.0f, 26.0f, 28.0f};
+        static constexpr const float RISK_HR_MIN[3] = { 0.0f, 90.0f, 90.0f }; // El cafe usa hoja humeda
 
-        static const int MEDIUM_RISK[3] = { 12, 10, 12 };
-        static const int HIGH_RISK[3] = { 24, 20, 24 };
-    }
+        static constexpr const int MEDIUM_RISK[3] = { 12, 10, 12 };
+        static constexpr const int HIGH_RISK[3] = { 24, 20, 24 };
+    };
+
+    struct WaterMeasure
+    {
+        float soil_c, soil_f;
+        float layer;
+        float reserv;
+        bool layer_ok, tank_ok;
+    };
+
+    struct WeatherMeasure
+    {
+        float temp, humidity, pressure, rad, leaf; // hoja y radiacion en %
+        bool ok;
+    };
+
+    struct Alert
+    {
+        uint8_t code;
+        uint8_t epoch;
+    };
+
+    enum HearthBeats
+    {
+        H_RAIN, H_WATER, H_CONTROL, H_WEATHER, H_LOGGER, H_MQTT, H_UI, H_N
+    };
 };
 
-#endif 
+#endif

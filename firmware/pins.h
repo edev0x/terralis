@@ -3,10 +3,9 @@
 
 #include <stdint.h>
 
-// Asignacion de pines del ESP32 (coincide con la tabla del documento)
 class Pins {
 public:
-    Pins() = delete;  // solo constantes, no se instancia
+    Pins() = delete;
 
     // I2C: OLED 0x3C, BMP180 0x77, DS1307 0x68
     static const uint8_t I2C_SDA = 21;
