@@ -41,7 +41,7 @@ public:
         BL_FAIULRE = 4
     };
 
-    const enum Season : uint8_t
+    enum Season : uint8_t
     {
         LLUVIOSA = 0,
         CANICULA = 1,
@@ -113,11 +113,18 @@ public:
         return e < 3 ? n[e] : "?";
     }
 
-    static const uint8_t INVERTED_RAD  = 0; // 1 si el modulo LDR da mas voltaje con menos luz
-    static const uint8_t ACTIVE_RELAY_LOW = 0; // 1 si los modulos del rele se activan con nivel bajo
-    static const uint8_t FORCE_DATE = 0; // 1 - Se fuerza fecha 2026-11-08 06:00 para epoca seca
+    static constexpr uint8_t INVERTED_RAD  = 0; // 1 si el modulo LDR da mas voltaje con menos luz
+    static constexpr uint8_t ACTIVE_RELAY_LOW = 0; // 1 si los modulos del rele se activan con nivel bajo
+    static constexpr uint8_t FORCE_DATE = 0; // 1 - Se fuerza fecha 2026-11-08 06:00 para epoca seca
     
-    static const uint8_t RF_SLOTS = 49; // 48 horas + hora en curso
+    static constexpr uint8_t RF_SLOTS = 49; // 48 horas + hora en curso
+
+    enum IrrigationState : uint8_t
+    {
+        IR_IN_RANGE = 0,
+        IR_IRRIGATING = 1,
+        IR_IDLE = 2
+    };
 };
 
 #endif
