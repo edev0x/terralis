@@ -6,12 +6,12 @@
 #include <Preferences.h>
 
 // Librerias de terceros
-// #include <PubSubClient.h>
-// #include <DHT.h>
-// #include <Adafruit_BMP085.h>
-// #include <Adafruit_GFX.h>
-// #include <Adafruit_SSD1306.h>
-// #include <RTClib.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <Adafruit_BMP085.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <RTClib.h>
 
 #include "config.h"
 #include "constants.h"
