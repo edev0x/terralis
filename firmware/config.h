@@ -79,11 +79,11 @@ public:
         Sensors() = delete;
 
         // Valores de distancia en cm.
-        static const float SOIL_DISTANCE = 40.0f;
+        static const float FLOOR_DISTANCE = 40.0f;
         static const float EMPTY_TANK_DISTANCE = 200.0f;
         static const float FULL_TANK_DISTANCE = 20.0f;
 
-        static const float MM_PER_TICK = 0.2f; // Milímetros de agua por pulso del sensor de flujo
+        static const float MM_PER_PULSE = 0.2f; // Milímetros de agua por pulso del sensor de flujo
         static const float RAIN_BLOCK_THRESHOLD = 5.0f; // Umbral para ultimas 6 horas
         static const float PRESSURE_HPA = 3.0f; // en 3 horas
 

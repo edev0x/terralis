@@ -11,9 +11,10 @@ class Utils
 public:
     Utils() = delete;
 
-    struct LayerParam {
+    struct LayerParam
+    {
         float target; // lamina objetivo cm
-        float strip; // banda +/- al rededor del objetivo
+        float strip;  // banda +/- al rededor del objetivo
         float margin; // el maximo permitido obj + margen
     };
 
@@ -137,11 +138,12 @@ public:
         float et0, d_coffe, d_bean;
     };
 
-    struct Balance {
-        float D;    // agotamiento en mm
+    struct Balance
+    {
+        float D;   // agotamiento en mm
         float TAW; // agua disponible total en mm
-        float p; // fracción de agotamiento permitida
-        float RAW() const { return p * TAW; } 
+        float p;   // fracción de agotamiento permitida
+        float RAW() const { return p * TAW; }
     };
 
     // Escribe un numero o el texto 'vacio' si el valor es invalido
@@ -163,12 +165,154 @@ public:
         snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d", date.year, date.month, date.day, date.hh, date.mi, date.ss);
     }
 
-private:
     static inline float
     clampf(float value, float low, float high)
     {
         return value < low ? low : (value > high ? high : low);
     }
+
+    struct RainTracker
+    {
+        float hours[24] = {};
+        uint32_t act_hour = 0;
+        float day_mm = 0.0f;
+        uint32_t act_day = 0;
+        bool started = false;
+
+        void init()
+        {
+            std::fill(std::begin(hours), std::end(hours), 0.0f);
+        }
+
+        void moveForward(uint32_t epoch)
+        {
+            uint32_t h = epoch / 3600u, d = epoch / 86400u;
+            if (!started)
+            {
+                act_hour = h;
+                act_day = d;
+                started = true;
+            }
+            if (h != act_hour)
+            {
+                if (h < act_hour || h - act_hour >= 24)
+                {
+                    for (int i = 0; i < 24; i++)
+                        hours[i] = 0.0f;
+                }
+                else
+                {
+                    for (uint32_t x = act_hour + 1; x <= h; x++)
+                        hours[x % 24] = 0.0f;
+                }
+                act_hour = h;
+            }
+            if (d != act_day)
+            {
+                day_mm = 0.0f;
+                act_day = d;
+            }
+        }
+
+        void add(float mm, uint32_t epoch)
+        {
+            moveForward(epoch);
+            hours[act_hour % 24] += mm;
+
+            day_mm += mm;
+        }
+
+        // Lluvia de las ultimas n horas (incluye la hora en curso).
+        float lasts(int n, uint32_t epoch)
+        {
+            moveForward(epoch);
+            float s = 0.0f;
+            for (int i = 0; i < n && i < 24; i++)
+                s += hours[(act_hour + 24 - i) % 24];
+            return s;
+        }
+
+        float day(uint32_t epoch)
+        {
+            moveForward(epoch);
+            return day_mm;
+        }
+    };
+
+    struct FungalRisk
+    {
+        uint8_t flags[Constants::Constants::RF_SLOTS];
+        uint32_t currentHour;
+        uint16_t favorable, total;
+        int medium, high;
+        bool started;
+
+        void init(int m, int a)
+        {
+            memset(flags, 0, sizeof(flags));
+            currentHour = 0;
+            favorable = 0;
+            total = 0;
+            medium = m;
+            high = a;
+            started = false;
+        }
+        void closeHour(uint32_t newHour)
+        {
+            uint8_t flag = (total > 0 && (uint32_t)favorable * 2u >= total) ? 1 : 0;
+            flags[currentHour % Constants::RF_SLOTS] = flag;
+            if (newHour < currentHour || newHour - currentHour > Constants::RF_SLOTS)
+            {
+                memset(flags, 0, sizeof(flags));
+            }
+            else
+            {
+                for (uint32_t h = currentHour + 1; h < newHour; h++)
+                    flags[h % Constants::RF_SLOTS] = 0;
+            }
+            flags[newHour % Constants::RF_SLOTS] = 0;
+            currentHour = newHour;
+            favorable = 0;
+            total = 0;
+        }
+        // hora = epoch / 3600 de la muestra
+        void sample(bool favorableSample, uint32_t hour)
+        {
+            if (!started)
+            {
+                currentHour = hour;
+                started = true;
+            }
+            else if (hour != currentHour)
+            {
+                closeHour(hour);
+            }
+            total++;
+            if (favorableSample)
+                favorable++;
+        }
+
+        // Horas favorables entre las ultimas 48 horas cerradas.
+        int h48() const
+        {
+            int count = 0;
+            for (int i = 0; i < Constants::RF_SLOTS; i++)
+                if ((uint32_t)i != currentHour % Constants::RF_SLOTS)
+                    count += flags[i];
+            return count;
+        }
+        
+        // 0 = bajo, 1 = medio, 2 = alto
+        uint8_t level() const
+        {
+            int hours = h48();
+            if (hours >= high)
+                return 2;
+            if (hours >= medium)
+                return 1;
+            return 0;
+        }
+    };
 };
 
 #endif
